@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>声の記録ツール</title>
+<style>
+body{font-family:system-ui,sans-serif;margin:0;padding:12px;background:#f6f7f9;color:#222}
+h1{font-size:1.2em;margin:4px 0 10px}
+button{font-size:1em;padding:10px 14px;border:0;border-radius:8px;background:#2563eb;color:#fff;margin:2px}
+button.stop{background:#dc2626} button.sec{background:#6b7280}
+.card{background:#fff;border-radius:10px;padding:10px;margin-bottom:10px;box-shadow:0 1px 3px #0002}
+.bar{height:14px;background:#e5e7eb;border-radius:7px;overflow:hidden}.bar>div{height:100%;background:#16a34a;width:0}
+#interim{color:#888;min-height:1.4em}
+.tw{overflow-x:auto}table{border-collapse:collapse;font-size:.85em;min-width:900px}
+td,th{border:1px solid #ddd;padding:4px;vertical-align:top}th{background:#eef}
+input[type=text]{width:100%;box-sizing:border-box;font-size:1em}
+#status{font-size:.85em;color:#555}
+</style></head><body>
+<h1>🎙 声の記録ツール</h1>
+<div class="card">
+<button id="btn">▶ 開始</button>
+<span id="status">停止中</span>
+<div style="margin-top:8px">音量: <span id="vol">-</span> dBFS<div class="bar"><div id="volbar"></div></div></div>
+<div style="margin-top:6px">ピッチ: <span id="pitch">-</span> Hz<div class="bar"><div id="pitchbar" style="background:#9333ea"></div></div></div>
+<div id="interim"></div>
+</div>
+<div class="card">
+<button class="sec" id="csv">CSV出力</button><button class="sec" id="json">JSON出力</button>
+<label><button class="sec" onclick="document.getElementById('imp').click()">JSON読込</button></label>
+<input type="file" id="imp" accept=".json,application/json" hidden>
+<button class="sec" id="clear">全削除</button>
+<details style="margin-top:8px"><summary>ライブ送信設定 (任意)</summary>
+<p style="font-size:.85em">Webhook URL（Google Apps Script のウェブアプリURLなど）を設定すると、確定した記録を即座にJSONでPOSTします。</p>
+<input type="text" id="hook" placeholder="https://script.google.com/macros/s/.../exec">
+<button class="sec" id="hooksave">保存</button> <span id="hookst"></span>
+</details>
+</div>
+<div class="card tw"><table><thead><tr><th>日時</th><th>テキスト</th><th>長さ s</th><th>平均/最大 dB</th><th>平均/最小/最大 Hz</th><th>文字/秒</th><th>間 回/秒</th><th>強さ</th><th>感情</th><th>メモ</th><th></th></tr></thead><tbody id="tb"></tbody></table></div>
+<script id="metrics">
+/* ==METRICS START== */
+function rmsDb(buf){let s=0;for(let i=0;i<buf.length;i++)s+=buf[i]*buf[i];const r=Math.sqrt(s/buf.length);return r>0?20*Math.log10(r):-Infinity;}
+function detectPitch(buf,sr,minHz=70,maxHz=500){
+  const n=buf.length;let s=0;for(let i=0;i<n;i++)s+=buf[i]*buf[i];if(Math.sqrt(s/n)<0.01)return null;
+  const minLag=Math.floor(sr/maxHz),maxLag=Math.min(Math.floor(sr/minHz),n-1);
+  const c=new Float32Array(maxLag+2);
+  for(let lag=minLag-1;lag<=maxLag+1;lag++){let a=0,e1=0,e2=0;for(let i=0;i+lag<n;i++){a+=buf[i]*buf[i+lag];e1+=buf[i]*buf[i];e2+=buf[i+lag]*buf[i+lag];}c[lag]=a/Math.sqrt(e1*e2||1);}
+  let best=-1,bl=-1;for(let lag=minLag;lag<=maxLag;lag++){if(c[lag]>best){best=c[lag];bl=lag;}}
+  if(best<0.5)return null;
+  // prefer shortest lag close to best (avoid octave-down errors)
+  for(let lag=minLag;lag<=maxLag;lag++){if(c[lag]>=best*0.9&&c[lag]>=c[lag-1]&&c[lag]>=c[lag+1]){bl=lag;break;}}
+  const y0=c[bl-1],y1=c[bl],y2=c[bl+1],d=y0-2*y1+y2;const sh=d?0.5*(y0-y2)/d:0;
+  return sr/(bl+sh);
+}
+// frames: [{t:ms, db:number, hz:number|null}], frame dt ms
+function summarize(frames,text,silenceDb=-45,minPauseMs=300){
+  if(!frames.length)return null;
+  const t0=frames[0].t,t1=frames[frames.length-1].t,dur=Math.max((t1-t0)/1000,0.001);
+  const voiced=frames.filter(f=>f.db>silenceDb);
+  const avgDb=voiced.length?20*Math.log10(Math.sqrt(voiced.reduce((a,f)=>a+Math.pow(10,f.db/10),0)/voiced.length)):null;
+  const peakDb=Math.max(...frames.map(f=>f.db));
+  const hz=frames.map(f=>f.hz).filter(h=>h);
+  let pc=0,pt=0,start=null,seenVoice=false;
+  for(const f of frames){if(f.db>silenceDb){if(start!==null&&seenVoice){const d=f.t-start;if(d>minPauseMs){pc++;pt+=d;}}start=null;seenVoice=true;}else if(start===null)start=f.t;}
+  const chars=(text||'').replace(/[\s、。！？!?,.]/g,'').length;
+  const r=x=>x==null||!isFinite(x)?null:Math.round(x*10)/10;
+  return{duration:r(dur),avgDb:r(avgDb),peakDb:r(peakDb),avgHz:r(hz.length?hz.reduce((a,b)=>a+b,0)/hz.length:null),minHz:r(hz.length?Math.min(...hz):null),maxHz:r(hz.length?Math.max(...hz):null),rate:r(chars/dur),pauses:pc,pauseSec:r(pt/1000)};
+}
+const COLS=['time','text','duration','avgDb','peakDb','avgHz','minHz','maxHz','rate','pauses','pauseSec','strength','emotion','memo'];
+function toCSV(recs){const esc=v=>{v=v==null?'':String(v);return /[",\n\r]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v;};
+  return '\uFEFF'+[COLS.join(','),...recs.map(r=>COLS.map(c=>esc(r[c])).join(','))].join('\r\n');}
+if(typeof module!=='undefined')module.exports={rmsDb,detectPitch,summarize,toCSV};
+/* ==METRICS END== */
+</script>
+<script>
+const $=id=>document.getElementById(id);
+let recs=JSON.parse(localStorage.getItem('vm_recs')||'[]');
+const save=()=>localStorage.setItem('vm_recs',JSON.stringify(recs));
+const STR=['未設定','強い','やや強い','普通','弱い'];
+const escH=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function render(){$('tb').innerHTML=recs.map((r,i)=>`<tr><td>${escH(new Date(r.time).toLocaleString('ja-JP'))}</td><td>${escH(r.text)}</td><td>${r.duration??''}</td><td>${r.avgDb??'-'} / ${r.peakDb??'-'}</td><td>${r.avgHz??'-'} / ${r.minHz??'-'} / ${r.maxHz??'-'}</td><td>${r.rate??''}</td><td>${r.pauses} / ${r.pauseSec}</td>
+<td><select data-i="${i}" data-k="strength">${STR.map(s=>`<option${s===(r.strength||'未設定')?' selected':''}>${s}</option>`).join('')}</select></td>
+<td><input type="text" list="emo" data-i="${i}" data-k="emotion" value="${escH(r.emotion)}"></td>
+<td><input type="text" data-i="${i}" data-k="memo" value="${escH(r.memo)}"></td><td><button class="sec" data-del="${i}">✕</button></td></tr>`).reverse().join('');}
+document.body.insertAdjacentHTML('beforeend','<datalist id="emo"><option>喜<option>怒<option>哀<option>楽<option>驚<option>不安<option>平静</datalist>');
+$('tb').addEventListener('change',e=>{const t=e.target;if(t.dataset.k){recs[t.dataset.i][t.dataset.k]=t.value;save();}});
+$('tb').addEventListener('click',e=>{const d=e.target.dataset.del;if(d!=null&&confirm('削除しますか？')){recs.splice(d,1);save();render();}});
+function dl(name,data,type){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([data],{type}));a.download=name;a.click();}
+const stamp=()=>new Date().toISOString().slice(0,16).replace(/[:T]/g,'-');
+$('csv').onclick=()=>dl(`voice-${stamp()}.csv`,toCSV(recs),'text/csv;charset=utf-8');
+$('json').onclick=()=>dl(`voice-${stamp()}.json`,JSON.stringify(recs,null,2),'application/json');
+$('imp').onchange=async e=>{const f=e.target.files[0];if(!f)return;try{const d=JSON.parse(await f.text());if(!Array.isArray(d))throw 0;const ex=new Set(recs.map(r=>r.time+r.text));d.forEach(r=>{if(!ex.has(r.time+r.text))recs.push(r)});recs.sort((a,b)=>new Date(a.time)-new Date(b.time));save();render();alert(d.length+'件読み込みました');}catch{alert('JSONの形式が不正です');}e.target.value='';};
+$('clear').onclick=()=>{if(confirm('全記録を削除しますか？（先にエクスポート推奨）')){recs=[];save();render();}};
+$('hook').value=localStorage.getItem('vm_hook')||'';
+$('hooksave').onclick=()=>{localStorage.setItem('vm_hook',$('hook').value.trim());$('hookst').textContent='保存しました';};
+function sendHook(r){const u=localStorage.getItem('vm_hook');if(!u)return;
+  fetch(u,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify(r)})
+  .then(()=>$('hookst').textContent='送信済 '+new Date().toLocaleTimeString('ja-JP')).catch(e=>$('hookst').textContent='送信失敗: '+e.message);}
+
+let running=false,ctx,an,stream,rec,frames=[],timer,buf;
+async function start(){
+  const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+  if(!SR){alert('このブラウザは音声認識に対応していません（Android Chromeを推奨）');return;}
+  try{stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});}
+  catch(e){alert('マイクを使えません: '+e.message+'\nhttps または localhost で開いてください');return;}
+  ctx=new (window.AudioContext||window.webkitAudioContext)();an=ctx.createAnalyser();an.fftSize=2048;
+  ctx.createMediaStreamSource(stream).connect(an);buf=new Float32Array(an.fftSize);frames=[];
+  timer=setInterval(()=>{an.getFloatTimeDomainData(buf);const db=rmsDb(buf),hz=detectPitch(buf,ctx.sampleRate);
+    frames.push({t:Date.now(),db:isFinite(db)?db:-100,hz});if(frames.length>3000)frames.shift();
+    $('vol').textContent=isFinite(db)?db.toFixed(1):'-∞';$('volbar').style.width=Math.max(0,Math.min(100,(db+70)/70*100))+'%';
+    $('pitch').textContent=hz?hz.toFixed(0):'-';$('pitchbar').style.width=hz?Math.min(100,hz/500*100)+'%':'0';},50);
+  rec=new SR();rec.lang='ja-JP';rec.continuous=true;rec.interimResults=true;
+  rec.onresult=e=>{let interim='';for(let i=e.resultIndex;i<e.results.length;i++){const r=e.results[i];
+    if(r.isFinal){finalize(r[0].transcript);}else interim+=r[0].transcript;}$('interim').textContent=interim;};
+  rec.onerror=e=>{$('status').textContent='認識エラー: '+e.error;};
+  rec.onend=()=>{if(running)try{rec.start()}catch{}};// Android stops periodically; restart
+  running=true;rec.start();$('btn').textContent='■ 停止';$('btn').className='stop';$('status').textContent='録音中…';
+}
+function finalize(text){text=text.trim();if(!text)return;
+  // utterance window = frames since previous finalize; trim leading/trailing silence
+  let f=frames.slice();frames=[];let a=f.findIndex(x=>x.db>-45),b=f.length-1;while(b>0&&f[b].db<=-45)b--;
+  if(a>=0)f=f.slice(a,b+1);const m=summarize(f,text)||{};
+  const r={time:new Date().toISOString(),text,...m,strength:'未設定',emotion:'',memo:''};
+  recs.push(r);save();render();sendHook(r);}
+function stop(){running=false;try{rec.stop()}catch{}clearInterval(timer);stream&&stream.getTracks().forEach(t=>t.stop());ctx&&ctx.close();
+  $('btn').textContent='▶ 開始';$('btn').className='';$('status').textContent='停止中';$('interim').textContent='';}
+$('btn').onclick=()=>running?stop():start();
+render();
+</script></body></html>
