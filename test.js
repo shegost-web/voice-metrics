@@ -1,6 +1,6 @@
 const fs=require('fs');const h=fs.readFileSync(__dirname+'/index.html','utf8');
 const src=h.split('/* ==METRICS START== */')[1].split('/* ==METRICS END== */')[0];
-const m={exports:{}};new Function('module',src)(m);const {rmsDb,detectPitch,summarize,toCSV}=m.exports;
+const m={exports:{}};new Function('module',src)(m);const {rmsDb,detectPitch,summarize,toCSV,isoLocal,aggregateSecond,timelineCSV,capTimeline}=m.exports;
 const sr=48000,N=2048;let fail=0;const ok=(c,msg)=>{console.log((c?'PASS ':'FAIL ')+msg);if(!c)fail++;};
 const sine=(f,a)=>Float32Array.from({length:N},(_,i)=>a*Math.sin(2*Math.PI*f*i/sr));
 ok(Math.abs(rmsDb(sine(440,1))-(-3.01))<0.05,'RMS full-scale sine = -3.01 dBFS: '+rmsDb(sine(440,1)).toFixed(2));
@@ -19,4 +19,11 @@ const s=summarize(fr,'こんにちは、元気です。');console.log(s);
 ok(s.pauses===1,'pause count 1 (200ms ignored)');ok(Math.abs(s.pauseSec-0.5)<0.06,'pause 0.5s');
 ok(s.peakDb===-10&&s.minHz===100&&s.maxHz===200,'peak/min/max');ok(Math.abs(s.rate-9/s.duration)<0.2,'rate chars/s');
 const c=toCSV([{time:'x',text:'a,"b"\n',strength:'強い'}]);ok(c.charCodeAt(0)===0xFEFF&&c.includes('"a,""b""\n"'),'CSV BOM+escape');
+// timeline
+const iso=isoLocal(Date.UTC(2026,0,1,0,0,0,5));ok(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}[+-]\d\d:\d\d$/.test(iso)&&new Date(iso).getTime()===Date.UTC(2026,0,1,0,0,0,5),'isoLocal '+iso);
+const sf=[];for(let k=0;k<20;k++)sf.push({t:k*50,db:k<10?-20:-60,hz:k<10?150:null});const ag=aggregateSecond(sf,1000,'はい');console.log(ag);
+ok(ag.voicedRatio===0.5&&ag.avgHz===150&&ag.peakDb===-20&&!ag.isSilent&&ag.text==='はい'&&ag.epochMs===1000,'aggregateSecond');
+ok(aggregateSecond(sf.slice(10),0,'').isSilent===true,'silent second');
+const tl={sessions:[{id:'a',rows:Array(5).fill(ag)},{id:'b',rows:Array(5).fill(ag)}]};capTimeline(tl,7);ok(tl.sessions.length===2&&tl.sessions[0].rows.length===2,'cap drops oldest');capTimeline(tl,4);ok(tl.sessions.length===1&&tl.sessions[0].id==='b','cap drops session');
+const tc=timelineCSV(tl);ok(tc.charCodeAt(0)===0xFEFF&&tc.split('\r\n').length===5,'timeline CSV');
 process.exit(fail?1:0);
