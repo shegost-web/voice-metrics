@@ -1,6 +1,6 @@
 const fs=require('fs');const h=fs.readFileSync(__dirname+'/index.html','utf8');
 const src=h.split('/* ==METRICS START== */')[1].split('/* ==METRICS END== */')[0];
-const m={exports:{}};new Function('module',src)(m);const {rmsDb,detectPitch,summarize,toCSV,isoLocal,aggregateSecond,timelineCSV,capTimeline}=m.exports;
+const m={exports:{}};new Function('module',src)(m);const {baselineDb,annotate,rmsDb,detectPitch,summarize,toCSV,isoLocal,aggregateSecond,timelineCSV,capTimeline}=m.exports;
 const sr=48000,N=2048;let fail=0;const ok=(c,msg)=>{console.log((c?'PASS ':'FAIL ')+msg);if(!c)fail++;};
 const sine=(f,a)=>Float32Array.from({length:N},(_,i)=>a*Math.sin(2*Math.PI*f*i/sr));
 ok(Math.abs(rmsDb(sine(440,1))-(-3.01))<0.05,'RMS full-scale sine = -3.01 dBFS: '+rmsDb(sine(440,1)).toFixed(2));
@@ -26,4 +26,14 @@ ok(ag.voicedRatio===0.5&&ag.avgHz===150&&ag.peakDb===-20&&!ag.isSilent&&ag.text=
 ok(aggregateSecond(sf.slice(10),0,'').isSilent===true,'silent second');
 const tl={sessions:[{id:'a',rows:Array(5).fill(ag)},{id:'b',rows:Array(5).fill(ag)}]};capTimeline(tl,7);ok(tl.sessions.length===2&&tl.sessions[0].rows.length===2,'cap drops oldest');capTimeline(tl,4);ok(tl.sessions.length===1&&tl.sessions[0].id==='b','cap drops session');
 const tc=timelineCSV(tl);ok(tc.charCodeAt(0)===0xFEFF&&tc.split('\r\n').length===5,'timeline CSV');
+// markers
+const mk=(segs)=>{const a=[];let t=0;for(const[n,db,hz]of segs)for(let k=0;k<n;k++){a.push({t,db,hz});t+=50;}return a;};
+ok(baselineDb([])===-30,'baseline fallback');ok(baselineDb([-20,-22,-24,-26,-28].map(x=>({avgDb:x})))===-24,'baseline median');
+let A=annotate(mk([[30,-20,150]]),'あ',-30);ok(A.loud&&!A.quiet&&!A.trailOff&&A.annotatedText==='📢【大】あ','loud '+A.annotatedText);
+A=annotate(mk([[30,-40,150]]),'あ',-30);ok(A.quiet&&A.annotatedText==='【小】あ','quiet');
+A=annotate(mk([[30,-30,150]]),'あ',-30);ok(!A.loud&&!A.quiet&&A.annotatedText==='あ','normal');
+A=annotate(mk([[30,-25,150],[10,-38,150]]),'あ',-28);ok(A.trailOff&&A.annotatedText.endsWith('↘〔尻すぼみ〕'),'trail off '+A.annotatedText);
+A=annotate(mk([[30,-25,150],[10,-30,150]]),'あ',-28);ok(!A.trailOff,'small drop not trail');
+A=annotate(mk([[30,-30,150],[10,-30,200]]),'あ',-30);ok(A.rising&&A.annotatedText.endsWith('↗'),'rising');
+A=annotate(mk([[30,-25,150],[10,-38,150]]),'あ',-28,{trailDb:20});ok(!A.trailOff,'threshold adjustable');
 process.exit(fail?1:0);

@@ -20,7 +20,9 @@ input[type=text]{width:100%;box-sizing:border-box;font-size:1em}
 <span id="status">停止中</span>
 <div style="margin-top:8px">音量: <span id="vol">-</span> dBFS<div class="bar"><div id="volbar"></div></div></div>
 <div style="margin-top:6px">ピッチ: <span id="pitch">-</span> Hz<div class="bar"><div id="pitchbar" style="background:#9333ea"></div></div></div>
-<div id="interim"></div>
+<div id="interim"></div><div id="lastann" style="font-weight:bold;min-height:1.4em"></div>
+<div style="font-size:.8em;color:#555;margin-top:4px">凡例: 📢【大】=普段より大きい ／ 【小】=普段より小さい ／ ↘〔尻すぼみ〕=語尾で音量が落ちた ／ ↗=語尾で声が上がった（基準=最近の発話の平均音量の中央値、5件未満は-30dB）</div>
+<details style="font-size:.85em"><summary>印の設定</summary>大 +<input id="m_loud" type="number" step="1" style="width:3em">dB 小 -<input id="m_quiet" type="number" step="1" style="width:3em">dB 尻すぼみ <input id="m_trail" type="number" step="1" style="width:3em">dB低下 ↗ +<input id="m_rise" type="number" step="1" style="width:3em">% <span id="m_base"></span></details>
 </div>
 <div class="card">
 <button class="sec" id="csv">CSV出力</button><button class="sec" id="json">JSON出力</button>
@@ -36,7 +38,7 @@ input[type=text]{width:100%;box-sizing:border-box;font-size:1em}
 <div class="card"><b>タイムライン（1秒ごと・通話との照合用）</b><div id="tlinfo" style="font-size:.85em;color:#555;margin:4px 0"></div>
 <button class="sec" id="tlcsv">タイムラインCSV</button><button class="sec" id="tljson">タイムラインJSON</button><button class="sec" id="tlclear">タイムライン消去</button></div>
 <div class="card"><b>録音ファイル</b><div id="austore" style="font-size:.85em;color:#555;margin:4px 0"></div><div id="aulist"></div></div>
-<div class="card tw"><table><thead><tr><th>日時</th><th>テキスト</th><th>長さ s</th><th>平均/最大 dB</th><th>平均/最小/最大 Hz</th><th>文字/秒</th><th>間 回/秒</th><th>強さ</th><th>感情</th><th>メモ</th><th></th></tr></thead><tbody id="tb"></tbody></table></div>
+<div class="card tw"><table><thead><tr><th>日時</th><th>テキスト</th><th>印つき</th><th>長さ s</th><th>平均/最大 dB</th><th>平均/最小/最大 Hz</th><th>文字/秒</th><th>間 回/秒</th><th>強さ</th><th>感情</th><th>メモ</th><th></th></tr></thead><tbody id="tb"></tbody></table></div>
 <script id="metrics">
 /* ==METRICS START== */
 function rmsDb(buf){let s=0;for(let i=0;i<buf.length;i++)s+=buf[i]*buf[i];const r=Math.sqrt(s/buf.length);return r>0?20*Math.log10(r):-Infinity;}
@@ -83,10 +85,23 @@ function timelineCSV(tl){const esc=v=>{v=v==null?'':String(v);return /[",\n\r]/.
 // keep at most maxRows across sessions, dropping oldest rows/sessions
 function capTimeline(tl,maxRows=21600){let n=tl.sessions.reduce((a,s)=>a+s.rows.length,0);
   while(n>maxRows&&tl.sessions.length){const s=tl.sessions[0],k=Math.min(s.rows.length,n-maxRows);s.rows.splice(0,k);n-=k;if(!s.rows.length)tl.sessions.shift();}return tl;}
-const COLS=['time','startMs','endMs','text','duration','avgDb','peakDb','avgHz','minHz','maxHz','rate','pauses','pauseSec','strength','emotion','memo'];
+// ---- voice markers ----
+function baselineDb(recs,fallback=-30,minN=5,win=20){const v=recs.slice(-win).map(r=>r.avgDb).filter(x=>x!=null&&isFinite(x)).sort((a,b)=>a-b);
+  if(v.length<minN)return fallback;const m=v.length>>1;return v.length%2?v[m]:(v[m-1]+v[m])/2;}
+const MARK_DEF={loudDb:6,quietDb:6,trailDb:8,riseRatio:0.15,silenceDb:-45};
+function annotate(frames,text,base,o={}){o={...MARK_DEF,...o};const pw=a=>a.length?10*Math.log10(a.reduce((s,f)=>s+Math.pow(10,f.db/10),0)/a.length):null;
+  const v=frames.filter(f=>f.db>o.silenceDb),avg=pw(v);const res={loud:false,quiet:false,trailOff:false,rising:false,baseDb:Math.round(base*10)/10};
+  if(avg!=null){res.loud=avg>=base+o.loudDb;res.quiet=avg<=base-o.quietDb;}
+  if(v.length>=8){const k=Math.max(2,Math.min(Math.ceil(v.length*0.25),12));const head=v.slice(0,v.length-k),tail=v.slice(-k);
+    res.trailOff=pw(head)-pw(tail)>=o.trailDb;
+    const hz=a=>{const h=a.map(f=>f.hz).filter(x=>x);return h.length>=2?h.reduce((s,x)=>s+x,0)/h.length:null;};const h1=hz(head),h2=hz(tail);
+    res.rising=!!(h1&&h2&&h2>=h1*(1+o.riseRatio));}
+  let t=text;if(res.loud)t='📢【大】'+t;else if(res.quiet)t='【小】'+t;if(res.trailOff)t+='↘〔尻すぼみ〕';if(res.rising)t+='↗';
+  res.annotatedText=t;return res;}
+const COLS=['time','annotatedText','loud','quiet','trailOff','rising','baseDb','startMs','endMs','text','duration','avgDb','peakDb','avgHz','minHz','maxHz','rate','pauses','pauseSec','strength','emotion','memo'];
 function toCSV(recs){const esc=v=>{v=v==null?'':String(v);return /[",\n\r]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v;};
   return '\uFEFF'+[COLS.join(','),...recs.map(r=>COLS.map(c=>esc(r[c])).join(','))].join('\r\n');}
-if(typeof module!=='undefined')module.exports={rmsDb,detectPitch,summarize,toCSV,isoLocal,aggregateSecond,timelineCSV,capTimeline};
+if(typeof module!=='undefined')module.exports={baselineDb,annotate,MARK_DEF,rmsDb,detectPitch,summarize,toCSV,isoLocal,aggregateSecond,timelineCSV,capTimeline};
 /* ==METRICS END== */
 </script>
 <script>
@@ -95,7 +110,7 @@ let recs=JSON.parse(localStorage.getItem('vm_recs')||'[]');
 const save=()=>localStorage.setItem('vm_recs',JSON.stringify(recs));
 const STR=['未設定','強い','やや強い','普通','弱い'];
 const escH=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-function render(){$('tb').innerHTML=recs.map((r,i)=>`<tr><td>${escH(new Date(r.time).toLocaleString('ja-JP'))}</td><td>${escH(r.text)}</td><td>${r.duration??''}</td><td>${r.avgDb??'-'} / ${r.peakDb??'-'}</td><td>${r.avgHz??'-'} / ${r.minHz??'-'} / ${r.maxHz??'-'}</td><td>${r.rate??''}</td><td>${r.pauses} / ${r.pauseSec}</td>
+function render(){$('tb').innerHTML=recs.map((r,i)=>`<tr><td>${escH(new Date(r.time).toLocaleString('ja-JP'))}</td><td>${escH(r.text)}</td><td>${escH(r.annotatedText??'')}</td><td>${r.duration??''}</td><td>${r.avgDb??'-'} / ${r.peakDb??'-'}</td><td>${r.avgHz??'-'} / ${r.minHz??'-'} / ${r.maxHz??'-'}</td><td>${r.rate??''}</td><td>${r.pauses} / ${r.pauseSec}</td>
 <td><select data-i="${i}" data-k="strength">${STR.map(s=>`<option${s===(r.strength||'未設定')?' selected':''}>${s}</option>`).join('')}</select></td>
 <td><input type="text" list="emo" data-i="${i}" data-k="emotion" value="${escH(r.emotion)}"></td>
 <td><input type="text" data-i="${i}" data-k="memo" value="${escH(r.memo)}"></td><td><button class="sec" data-del="${i}">✕</button></td></tr>`).reverse().join('');}
@@ -172,6 +187,13 @@ if(navigator.storage&&navigator.storage.persist)navigator.storage.persist().then
 addEventListener('pagehide',()=>{if(mr&&mr.state==='recording')try{mr.requestData()}catch{}if(auSess){auSess.endMs=Date.now();auPut(auSess);}});
 auRender();
 
+let mopt={...MARK_DEF};try{Object.assign(mopt,JSON.parse(localStorage.getItem('vm_markopt')||'{}'))}catch{}
+const MF={m_loud:'loudDb',m_quiet:'quietDb',m_trail:'trailDb'};
+for(const[id,k]of Object.entries(MF)){$(id).value=mopt[k];$(id).onchange=()=>{mopt[k]=+$(id).value||MARK_DEF[k];msave();};}
+$('m_rise').value=Math.round(mopt.riseRatio*100);$('m_rise').onchange=()=>{mopt.riseRatio=(+$('m_rise').value||15)/100;msave();};
+function msave(){localStorage.setItem('vm_markopt',JSON.stringify(mopt));mbase();}
+function mbase(){$('m_base').textContent=`現在の基準 ${baselineDb(recs).toFixed(1)} dB`;}mbase();
+
 let running=false,ctx,an,stream,rec,frames=[],timer,buf;
 async function start(){
   const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
@@ -194,9 +216,9 @@ async function start(){
 function finalize(text){text=text.trim();if(!text)return;
   // utterance window = frames since previous finalize; trim leading/trailing silence
   let f=frames.slice();frames=[];let a=f.findIndex(x=>x.db>-45),b=f.length-1;while(b>0&&f[b].db<=-45)b--;
-  if(a>=0)f=f.slice(a,b+1);const m=summarize(f,text)||{};
-  const r={time:new Date().toISOString(),startMs:f.length?f[0].t:null,endMs:f.length?f[f.length-1].t:null,text,...m,strength:'未設定',emotion:'',memo:''};
-  recs.push(r);save();render();sendHook(r);}
+  if(a>=0)f=f.slice(a,b+1);const m=summarize(f,text)||{};const an=annotate(f,text,baselineDb(recs),mopt);
+  const r={time:new Date().toISOString(),startMs:f.length?f[0].t:null,endMs:f.length?f[f.length-1].t:null,text,annotatedText:an.annotatedText,loud:an.loud,quiet:an.quiet,trailOff:an.trailOff,rising:an.rising,baseDb:an.baseDb,...m,strength:'未設定',emotion:'',memo:''};
+  recs.push(r);save();render();sendHook(r);$('lastann').textContent=an.annotatedText;mbase();}
 function stop(){running=false;try{rec.stop()}catch{}clearInterval(timer);auStop();tlStop();stream&&stream.getTracks().forEach(t=>t.stop());ctx&&ctx.close();
   $('btn').textContent='▶ 開始';$('btn').className='';$('status').textContent='停止中';$('interim').textContent='';}
 $('btn').onclick=()=>running?stop():start();
