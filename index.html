@@ -35,6 +35,7 @@ input[type=text]{width:100%;box-sizing:border-box;font-size:1em}
 </div>
 <div class="card"><b>タイムライン（1秒ごと・通話との照合用）</b><div id="tlinfo" style="font-size:.85em;color:#555;margin:4px 0"></div>
 <button class="sec" id="tlcsv">タイムラインCSV</button><button class="sec" id="tljson">タイムラインJSON</button><button class="sec" id="tlclear">タイムライン消去</button></div>
+<div class="card"><b>録音ファイル</b><div id="austore" style="font-size:.85em;color:#555;margin:4px 0"></div><div id="aulist"></div></div>
 <div class="card tw"><table><thead><tr><th>日時</th><th>テキスト</th><th>長さ s</th><th>平均/最大 dB</th><th>平均/最小/最大 Hz</th><th>文字/秒</th><th>間 回/秒</th><th>強さ</th><th>感情</th><th>メモ</th><th></th></tr></thead><tbody id="tb"></tbody></table></div>
 <script id="metrics">
 /* ==METRICS START== */
@@ -129,6 +130,48 @@ $('tlclear').onclick=()=>{if(confirm('タイムラインを全て消去します
 addEventListener('pagehide',()=>tlSess&&tlSave());
 tlInfo();
 
+// ---- raw audio (MediaRecorder -> IndexedDB) ----
+let adb,mr,auSess=null,auIdx=0;
+const idb=()=>adb||(adb=new Promise((ok,ng)=>{const q=indexedDB.open('vm_audio',1);q.onupgradeneeded=()=>{const d=q.result;d.createObjectStore('sessions',{keyPath:'id'});d.createObjectStore('chunks',{autoIncrement:true}).createIndex('sid','sid');};q.onsuccess=()=>ok(q.result);q.onerror=()=>ng(q.error);}));
+async function tx(stores,mode,fn){const d=await idb();return new Promise((ok,ng)=>{const t=d.transaction(stores,mode);let r;Promise.resolve(fn(t)).then(v=>r=v);t.oncomplete=()=>ok(r);t.onerror=()=>ng(t.error);});}
+const reqP=q=>new Promise((ok,ng)=>{q.onsuccess=()=>ok(q.result);q.onerror=()=>ng(q.error);});
+const auPut=x=>tx(['sessions'],'readwrite',t=>t.objectStore('sessions').put(x));
+function pickMime(){for(const m of['audio/webm;codecs=opus','audio/webm','audio/ogg;codecs=opus','audio/mp4'])if(window.MediaRecorder&&MediaRecorder.isTypeSupported(m))return m;return '';}
+function auStart(){if(!window.MediaRecorder){$('austore').textContent='このブラウザは録音保存（MediaRecorder）に非対応です';return;}
+  try{const mt=pickMime();mr=new MediaRecorder(stream,mt?{mimeType:mt}:{});}catch(e){$('austore').textContent='録音保存エラー: '+e.message;return;}
+  const t=Date.now();auSess={id:tlSess?tlSess.id:isoLocal(t),startMs:t,endMs:t,mimeType:mr.mimeType||pickMime()||'audio/webm',bytes:0,chunks:0,done:false};auIdx=0;
+  if(tlSess)tlSess.audioStartMs=t;const cur=auSess;auPut(cur);
+  mr.ondataavailable=e=>{if(!e.data||!e.data.size)return;cur.endMs=Date.now();cur.bytes+=e.data.size;cur.chunks++;const i=auIdx++;
+    tx(['sessions','chunks'],'readwrite',t=>{t.objectStore('chunks').put({sid:cur.id,i,blob:e.data});t.objectStore('sessions').put(cur);}).then(()=>{if(cur.done||i%3==0)auRender();}).catch(err=>$('austore').textContent='保存失敗: '+err.message);};
+  mr.onstop=()=>{cur.done=true;cur.endMs=Date.now();auPut(cur).then(auRender);};
+  mr.start(10000);}
+function auStop(){if(mr&&mr.state!=='inactive'){try{mr.requestData();mr.stop();}catch{}}mr=null;auSess=null;}
+async function auBlob(id){const ch=await tx(['chunks'],'readonly',t=>reqP(t.objectStore('chunks').index('sid').getAll(id)));
+  const s=await tx(['sessions'],'readonly',t=>reqP(t.objectStore('sessions').get(id)));ch.sort((a,b)=>a.i-b.i);return{s,blob:new Blob(ch.map(c=>c.blob),{type:s.mimeType})};}
+const pad=n=>String(n).padStart(2,'0');
+function auName(s){const d=new Date(s.startMs);const ext=/mp4/.test(s.mimeType)?'m4a':/ogg/.test(s.mimeType)?'ogg':'webm';
+  return `voice_${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.${ext}`;}
+const fmtB=b=>b>1e9?(b/1e9).toFixed(2)+' GB':b>1e6?(b/1e6).toFixed(1)+' MB':(b/1e3).toFixed(0)+' KB';
+async function auRender(){let list=[];try{list=await tx(['sessions'],'readonly',t=>reqP(t.objectStore('sessions').getAll()));}catch(e){$('aulist').textContent='IndexedDBを使えません: '+e.message;return;}
+  list.sort((a,b)=>b.startMs-a.startMs);
+  $('aulist').innerHTML=list.length?list.map(s=>{const sec=Math.round((s.endMs-s.startMs)/1000);return `<div style="border-top:1px solid #eee;padding:6px 0" data-sid="${escH(s.id)}">
+<div>${escH(new Date(s.startMs).toLocaleString('ja-JP',{timeZone:'Asia/Tokyo'}))} JST ・ ${Math.floor(sec/60)}分${sec%60}秒 ・ ${fmtB(s.bytes)}${s===auSess||(!s.done&&auSess&&auSess.id===s.id)?' ・ 録音中':''}</div>
+<button class="sec" data-a="play">▶ 再生</button><button class="sec" data-a="dl">ダウンロード</button><button class="sec" data-a="both">まとめて書き出し</button><button class="sec" data-a="del">削除</button><div class="pl"></div></div>`;}).join(''):'<span style="color:#888">保存された録音はありません</span>';
+  if(navigator.storage&&navigator.storage.estimate){const e=await navigator.storage.estimate();const per=navigator.storage.persisted?await navigator.storage.persisted():false;
+    $('austore').textContent=`ブラウザ保存容量: ${fmtB(e.usage||0)} / ${fmtB(e.quota||0)} 使用（${per?'永続化済み':'永続化なし：容量不足時に消える可能性あり'}）`;}}
+$('aulist').addEventListener('click',async e=>{const a=e.target.dataset.a;if(!a)return;const box=e.target.closest('[data-sid]'),id=box.dataset.sid;
+  if(a==='del'){if(!confirm('この録音を削除しますか？（先にダウンロード推奨）'))return;
+    await tx(['sessions','chunks'],'readwrite',async t=>{t.objectStore('sessions').delete(id);const ks=await reqP(t.objectStore('chunks').index('sid').getAllKeys(id));ks.forEach(k=>t.objectStore('chunks').delete(k));});auRender();return;}
+  const {s,blob}=await auBlob(id);
+  if(a==='play'){const p=box.querySelector('.pl');p.innerHTML='';const au=document.createElement('audio');au.controls=true;au.style.width='100%';au.src=URL.createObjectURL(blob);p.appendChild(au);au.play().catch(()=>{});}
+  if(a==='dl'||a==='both')dl(auName(s),blob,s.mimeType);
+  if(a==='both'){tlSave();const ts=tl.sessions.find(x=>x.id===id);
+    const j={tz:Intl.DateTimeFormat().resolvedOptions().timeZone,exportedAt:isoLocal(Date.now()),audioFile:auName(s),audioStartMs:s.startMs,audioStartIso:isoLocal(s.startMs),mimeType:s.mimeType,sessions:ts?[ts]:[]};
+    setTimeout(()=>dl(auName(s).replace(/\.\w+$/,'_timeline.json'),JSON.stringify(j,null,1),'application/json'),500);}});
+if(navigator.storage&&navigator.storage.persist)navigator.storage.persist().then(auRender);
+addEventListener('pagehide',()=>{if(mr&&mr.state==='recording')try{mr.requestData()}catch{}if(auSess){auSess.endMs=Date.now();auPut(auSess);}});
+auRender();
+
 let running=false,ctx,an,stream,rec,frames=[],timer,buf;
 async function start(){
   const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
@@ -146,7 +189,7 @@ async function start(){
     if(r.isFinal){secText+=(secText?' ':'')+r[0].transcript.trim();finalize(r[0].transcript);}else interim+=r[0].transcript;}curInterim=interim.trim();$('interim').textContent=interim;};
   rec.onerror=e=>{if(e.error==='not-allowed'){running=false;$('status').textContent='マイクを許可するか、画面をタップしてください';}else $('status').textContent='認識エラー: '+e.error;};
   rec.onend=()=>{if(running)try{rec.start()}catch{}};// Android stops periodically; restart
-  running=true;tlStart();rec.start();$('btn').textContent='■ 停止';$('btn').className='stop';$('status').textContent='録音中…';
+  running=true;tlStart();auStart();rec.start();$('btn').textContent='■ 停止';$('btn').className='stop';$('status').textContent='録音中…';
 }
 function finalize(text){text=text.trim();if(!text)return;
   // utterance window = frames since previous finalize; trim leading/trailing silence
@@ -154,7 +197,7 @@ function finalize(text){text=text.trim();if(!text)return;
   if(a>=0)f=f.slice(a,b+1);const m=summarize(f,text)||{};
   const r={time:new Date().toISOString(),startMs:f.length?f[0].t:null,endMs:f.length?f[f.length-1].t:null,text,...m,strength:'未設定',emotion:'',memo:''};
   recs.push(r);save();render();sendHook(r);}
-function stop(){running=false;try{rec.stop()}catch{}clearInterval(timer);tlStop();stream&&stream.getTracks().forEach(t=>t.stop());ctx&&ctx.close();
+function stop(){running=false;try{rec.stop()}catch{}clearInterval(timer);auStop();tlStop();stream&&stream.getTracks().forEach(t=>t.stop());ctx&&ctx.close();
   $('btn').textContent='▶ 開始';$('btn').className='';$('status').textContent='停止中';$('interim').textContent='';}
 $('btn').onclick=()=>running?stop():start();
 render();
